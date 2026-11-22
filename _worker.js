@@ -1,4 +1,5 @@
 const CF_PORTS = [443, 2053, 2083, 2087, 2096, 8443];
+const MAX_CUSTOM_REGION_COUNT = 10;
 const TEMPLATE_UUID = '00000000-0000-4000-8000-000000000000';
 const TEMPLATE_HOST = 'example.com';
 
@@ -7,14 +8,24 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
 
-    // 1. 後台管理介面 (/admin)
+    // 1. 首頁 (/)：節點訂閱拼接生成器（無需密碼，打開即用）
+    if (path === '/') {
+      const rawData = (await env.KV.get('raw_iplist', { cacheTtl: 60 })) || '';
+      const parsed = parseRawIPList(rawData, '');
+      const regions = Object.keys(parsed.regionIps);
+      return new Response(renderGeneratorHTML(regions), {
+        headers: { 'Content-Type': 'text/html; charset=utf-8' },
+      });
+    }
+
+    // 2. 後台管理介面 (/admin)
     if (path === '/admin') {
       return new Response(renderAdminHTML(), {
         headers: { 'Content-Type': 'text/html; charset=utf-8' },
       });
     }
 
-    // 2. 後台 API：驗證密碼並讀取 env.KV 原始資料（不設快取，確保編輯時讀取最新資料）
+    // 3. 後台 API：驗證密碼並讀取 env.KV 原始資料
     if (path === '/api/load' && request.method === 'POST') {
       const { password } = await request.json().catch(() => ({}));
       if (!env.ADMIN_PASSWORD || password !== env.ADMIN_PASSWORD) {
@@ -24,7 +35,7 @@ export default {
       return jsonResponse({ data: rawData });
     }
 
-    // 3. 後台 API：驗證密碼並寫入 env.KV
+    // 4. 後台 API：驗證密碼並寫入 env.KV
     if (path === '/api/save' && request.method === 'POST') {
       const { password, data } = await request.json().catch(() => ({}));
       if (!env.ADMIN_PASSWORD || password !== env.ADMIN_PASSWORD) {
@@ -34,8 +45,8 @@ export default {
       return jsonResponse({ success: true });
     }
 
-    // 4. 明文列表接口 (/ 或 /all_list.txt)：僅當 SHOW_LIST === '1' 時開放檢視
-    if (path === '/' || path === '/all_list.txt') {
+    // 5. 原明文列表接口 (/all 與 /all_list.txt)：僅當 SHOW_LIST === '1' 時開放檢視
+    if (path === '/all' || path === '/all_list.txt') {
       if (String(env.SHOW_LIST ?? '0') !== '1') {
         return new Response('Not Found', { status: 404 });
       }
@@ -61,8 +72,51 @@ export default {
       });
     }
 
-    // 5. 外部 sub:// 優選訂閱生成器接口 (/sub)
-    // 預設無條件接受外部 sub:// 請求（相容 sub://域名 與 sub://域名/sub）
+    // 6. 自訂地區節點拼接訂閱接口 (/custom_sub)
+    // 每次客戶端更新訂閱時即時洗牌抽樣，若原鏈接有 port 則套用隨機 CF 6 端口之一
+    if (path === '/custom_sub') {
+      const rawData = await env.KV.get('raw_iplist', { cacheTtl: 60 });
+      if (!rawData) {
+        return new Response(encodeBase64UTF8(''), {
+          headers: {
+            'Content-Type': 'text/plain; charset=utf-8',
+            'Cache-Control': 'no-store, no-cache, must-revalidate',
+          },
+        });
+      }
+
+      const tplParam = url.searchParams.get('tpl') || '';
+      const templateLink = decodeURIComponentSafe(tplParam).trim();
+      const selectedRegions = (url.searchParams.get('regions') || '')
+        .split(',')
+        .map((s) => decodeURIComponentSafe(s).trim())
+        .filter(Boolean);
+
+      const rawCount = parseInt(url.searchParams.get('count') || env.CUSTOM_REGION_COUNT || '5', 10);
+      const perCount = clampCustomCount(rawCount);
+      const tplHasPort = templateHasPort(templateLink);
+
+      if (!templateLink || selectedRegions.length === 0) {
+        return new Response('Missing tpl or regions', { status: 400 });
+      }
+
+      const items = generateCustomRegionItems(rawData, selectedRegions, perCount);
+      const links = items
+        .map((item) => {
+          const addrWithPort = tplHasPort ? assignRandomCFPort(item.address) : item.address;
+          return buildNodeFromTemplate(templateLink, addrWithPort, item.remark);
+        })
+        .filter(Boolean);
+
+      return new Response(encodeBase64UTF8(links.join('\n')), {
+        headers: {
+          'Content-Type': 'text/plain; charset=utf-8',
+          'Cache-Control': 'no-store, no-cache, must-revalidate',
+        },
+      });
+    }
+
+    // 7. 外部 sub:// 優選訂閱生成器接口 (/sub)
     if (path === '/sub') {
       const rawData = await env.KV.get('raw_iplist', { cacheTtl: 3600 });
       if (!rawData) {
@@ -90,17 +144,61 @@ export default {
   },
 };
 
-/**
- * 解析 KV 原始列表並執行：
- * 1. 識別頂部或獨立的「地址#備註」（含 HEADER_NOTE）
- * 2. 按地區分組、Fisher-Yates 隨機抽樣、全局去重與多地區合併備註
- * 3. 依 RANDOM_CF_PORT 為純 IP 隨機附加 Cloudflare 6 個常用端口（已有端口則保留）
- */
-function generateSelectedItems(rawText, env) {
-  const perRegionCount = Math.max(1, parseInt(env.PER_REGION_COUNT || '5', 10) || 5);
-  const headerNote = (env.HEADER_NOTE || '').trim();
-  const randomCfPort = ['1', 'true'].includes(String(env.RANDOM_CF_PORT || '').toLowerCase());
+function clampCustomCount(val) {
+  if (!Number.isFinite(val) || val < 1) return 5;
+  return Math.min(MAX_CUSTOM_REGION_COUNT, Math.max(1, Math.floor(val)));
+}
 
+/**
+ * 檢查輸入的原始節點鏈接是否包含端口
+ */
+function templateHasPort(templateStr) {
+  const raw = String(templateStr || '').trim();
+  if (!raw) return false;
+  const hashIdx = raw.indexOf('#');
+  const withoutHash = hashIdx > -1 ? raw.slice(0, hashIdx) : raw;
+  const match = withoutHash.match(/^[a-z][a-z0-9+\-.]*:\/\/(?:[^@/?#]+@)?([^/?#]+)/i);
+  if (!match) return false;
+
+  const hostPort = match[1].trim();
+  if (hostPort.startsWith('[')) {
+    return /\]:\d+$/.test(hostPort);
+  }
+  const colonIdx = hostPort.lastIndexOf(':');
+  return colonIdx > -1 && /^\d+$/.test(hostPort.slice(colonIdx + 1));
+}
+
+/**
+ * 將地址的端口替換或附加為 CF 6 端口中的隨機一種
+ */
+function assignRandomCFPort(address) {
+  const addr = String(address || '').trim();
+  if (!addr) return addr;
+
+  const port = CF_PORTS[Math.floor(Math.random() * CF_PORTS.length)];
+  const bareAddr = stripExistingPort(addr);
+  const unbracketedIPv6 = !bareAddr.startsWith('[') && (bareAddr.match(/:/g) || []).length >= 2;
+  const host = unbracketedIPv6 ? `[${bareAddr}]` : bareAddr;
+
+  return `${host}:${port}`;
+}
+
+function stripExistingPort(addr) {
+  if (addr.startsWith('[')) {
+    const m = addr.match(/^(\[[^\]]+\])(?::\d+)?$/);
+    return m ? m[1] : addr;
+  }
+  const colonIdx = addr.lastIndexOf(':');
+  if (colonIdx > -1 && /^\d+$/.test(addr.slice(colonIdx + 1))) {
+    return addr.slice(0, colonIdx);
+  }
+  return addr;
+}
+
+/**
+ * 解析 KV 原始資料結構
+ */
+function parseRawIPList(rawText, headerNote = '') {
   const combinedText = headerNote ? `${headerNote}\n${rawText}` : rawText;
   const lines = combinedText.split(/\r?\n/);
 
@@ -118,7 +216,6 @@ function generateSelectedItems(rawText, env) {
     const addrPart = hashIdx > -1 ? line.slice(0, hashIdx).trim() : line;
     const inlineRemark = hashIdx > -1 ? line.slice(hashIdx + 1).trim() : '';
 
-    // 不含點與冒號且無 # 備註的行，視為地區標頭
     if (!addrPart.includes('.') && !addrPart.includes(':') && hashIdx === -1) {
       currentRegion = addrPart;
       if (!regionIps[currentRegion]) {
@@ -129,7 +226,6 @@ function generateSelectedItems(rawText, env) {
 
     if (!addrPart) continue;
 
-    // 尚未進入任何地區區塊前的地址（如 HEADER_NOTE 中的 cmin2.cc.cd#移動專用...）
     if (!currentRegion) {
       standaloneItems.push({
         address: addrPart,
@@ -152,10 +248,22 @@ function generateSelectedItems(rawText, env) {
     }
   }
 
+  return { standaloneItems, regionIps, ipRegionsMap, ipCustomRemarkMap };
+}
+
+/**
+ * 全區抽樣（供 /all 與 /sub 使用）
+ */
+function generateSelectedItems(rawText, env) {
+  const perRegionCount = Math.max(1, parseInt(env.PER_REGION_COUNT || '5', 10) || 5);
+  const headerNote = (env.HEADER_NOTE || '').trim();
+  const randomCfPort = ['1', 'true'].includes(String(env.RANDOM_CF_PORT || '').toLowerCase());
+
+  const { standaloneItems, regionIps, ipRegionsMap, ipCustomRemarkMap } = parseRawIPList(rawText, headerNote);
+
   const selectedList = [];
   const seenAddresses = new Set();
 
-  // 先加入獨立頂部項目（例如 HEADER_NOTE）
   for (const item of standaloneItems) {
     if (!seenAddresses.has(item.address)) {
       seenAddresses.add(item.address);
@@ -166,7 +274,6 @@ function generateSelectedItems(rawText, env) {
     }
   }
 
-  // 遍歷每個地區，隨機洗牌後抽取最多 perRegionCount 個不重複地址
   for (const region of Object.keys(regionIps)) {
     const shuffled = shuffleArray([...regionIps[region]]);
     let picked = 0;
@@ -192,16 +299,66 @@ function generateSelectedItems(rawText, env) {
 }
 
 /**
- * 埠號處理規則：
- * - 已有端口（ip:port 或 [ipv6]:port）-> 原樣保留
- * - 純 IPv4 / 純 IPv6 -> 若啟用 randomCfPort，隨機加 CF 6 端口之一；否則保持純 IP
- * - 域名（無端口）-> 保持原樣不補端口
+ * 依指定地區與每區數量抽樣（供 /custom_sub 使用），備註為所屬地區名稱（多區合併以 - 連接）
+ */
+function generateCustomRegionItems(rawText, targetRegions, perCount) {
+  const { regionIps, ipRegionsMap } = parseRawIPList(rawText, '');
+  const selectedList = [];
+  const seenAddresses = new Set();
+
+  for (const region of targetRegions) {
+    const pool = regionIps[region];
+    if (!pool || !pool.length) continue;
+
+    const shuffled = shuffleArray([...pool]);
+    let picked = 0;
+
+    for (const addr of shuffled) {
+      if (picked >= perCount) break;
+      if (!seenAddresses.has(addr)) {
+        seenAddresses.add(addr);
+        const matchedInSelected = (ipRegionsMap[addr] || []).filter((r) => targetRegions.includes(r));
+        const regionRemark = (matchedInSelected.length ? matchedInSelected : [region]).join('-');
+
+        selectedList.push({
+          address: addr,
+          remark: regionRemark,
+        });
+        picked++;
+      }
+    }
+  }
+
+  return selectedList;
+}
+
+/**
+ * 將輸入節點鏈接中的主機/端口替換為新地址，並將 # 後備註替換為地區名稱
+ */
+function buildNodeFromTemplate(templateStr, newAddress, regionRemark) {
+  const raw = templateStr.trim();
+  if (!raw || !newAddress) return '';
+
+  const hashIdx = raw.indexOf('#');
+  const withoutHash = hashIdx > -1 ? raw.slice(0, hashIdx) : raw;
+
+  const match = withoutHash.match(/^([a-z][a-z0-9+\-.]*:\/\/)(?:([^@/?#]+)@)?([^/?#]+)(.*)$/i);
+  if (!match) return '';
+
+  const [, scheme, userInfo, , rest] = match;
+  const authPrefix = userInfo ? `${userInfo}@` : '';
+  const encodedRemark = encodeURIComponent(regionRemark);
+
+  return `${scheme}${authPrefix}${newAddress}${rest}#${encodedRemark}`;
+}
+
+/**
+ * 埠號處理規則（供 /all 與 /sub 使用）
  */
 function applyPortRule(address, randomCfPort) {
   const addr = address.trim();
   if (!addr) return addr;
 
-  // 檢查是否已包含端口
   if (addr.startsWith('[')) {
     if (/\]:\d+$/.test(addr)) return addr;
   } else {
@@ -213,7 +370,6 @@ function applyPortRule(address, randomCfPort) {
 
   if (!randomCfPort) return addr;
 
-  // 判斷是否為純 IPv4 或純 IPv6（不含端口）
   const pureIPv4 = /^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}$/.test(addr);
   const bareIPv6 = addr.startsWith('[') && addr.endsWith(']') && addr.includes(':');
   const unbracketedIPv6 = !addr.startsWith('[') && (addr.match(/:/g) || []).length >= 2;
@@ -227,17 +383,10 @@ function applyPortRule(address, randomCfPort) {
   return addr;
 }
 
-/**
- * 明文格式輸出：地址#備註
- */
 function formatPlainItem(item) {
   return item.remark ? `${item.address}#${item.remark}` : item.address;
 }
 
-/**
- * 轉為上游 sub:// 聚合器可識別的佔位模板連結
- * 若外部項目解析 /:\/\/[^@]+@([^?]+)/，無端口時仍可正常提取純 IP / 域名
- */
 function formatSubTemplateLink(item) {
   if (!item?.address) return '';
   if (/^[a-z][a-z0-9+\-.]*:\/\//i.test(item.address)) {
@@ -247,9 +396,14 @@ function formatSubTemplateLink(item) {
   return `vless://${TEMPLATE_UUID}@${item.address}?security=tls&type=ws&host=${TEMPLATE_HOST}&sni=${TEMPLATE_HOST}&path=%2F#${remark}`;
 }
 
-/**
- * 支援 UTF-8 字元（中文備註）的 Base64 編碼
- */
+function decodeURIComponentSafe(str) {
+  try {
+    return decodeURIComponent(str);
+  } catch {
+    return str;
+  }
+}
+
 function encodeBase64UTF8(str) {
   const bytes = new TextEncoder().encode(str);
   let binary = '';
@@ -259,7 +413,6 @@ function encodeBase64UTF8(str) {
   return btoa(binary);
 }
 
-// Fisher-Yates 真隨機洗牌演算法
 function shuffleArray(arr) {
   for (let i = arr.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
@@ -273,6 +426,169 @@ function jsonResponse(obj, status = 200) {
     status,
     headers: { 'Content-Type': 'application/json; charset=utf-8' },
   });
+}
+
+// 首頁：節點訂閱拼接生成器
+function renderGeneratorHTML(regions) {
+  const safeRegions = regions.map((r) => escapeHTML(r));
+  const checkboxesHTML = safeRegions.length
+    ? safeRegions
+        .map(
+          (r) =>
+            `<label class="chk"><input type="checkbox" name="region" value="${r}" /><span>${r}</span></label>`
+        )
+        .join('')
+    : `<div class="empty">目前 KV 中尚無地區資料，請先至 /admin 維護 raw_iplist</div>`;
+
+  return `<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>地區節點訂閱生成器</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #0f172a; color: #f8fafc;
+      display: flex; justify-content: center; padding: 24px 16px;
+    }
+    .box {
+      width: 100%; max-width: 780px; background: #1e293b;
+      border: 1px solid #334155; border-radius: 12px; padding: 22px;
+    }
+    h2 { font-size: 1.2rem; margin-bottom: 16px; }
+    label.field-title { display: block; font-size: 14px; color: #cbd5e1; margin-bottom: 8px; }
+    textarea.tpl-input {
+      width: 100%; height: 110px; background: #020617; color: #38bdf8;
+      border: 1px solid #334155; border-radius: 8px; padding: 10px 12px;
+      font-family: ui-monospace, monospace; font-size: 12.5px; line-height: 1.45;
+      resize: vertical; outline: none; margin-bottom: 16px;
+    }
+    textarea.tpl-input:focus { border-color: #38bdf8; }
+    .regions-wrap {
+      display: flex; flex-wrap: wrap; gap: 10px;
+      background: #0f172a; border: 1px solid #334155; border-radius: 8px;
+      padding: 12px; margin-bottom: 16px;
+    }
+    .chk {
+      display: inline-flex; align-items: center; gap: 6px;
+      background: #1e293b; border: 1px solid #334155; border-radius: 6px;
+      padding: 6px 10px; cursor: pointer; font-size: 13.5px; user-select: none;
+    }
+    .chk input { accent-color: #38bdf8; cursor: pointer; }
+    .empty { font-size: 13px; color: #94a3b8; }
+    .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 18px; }
+    .count-box { display: flex; align-items: center; gap: 8px; font-size: 14px; color: #cbd5e1; }
+    input[type="number"] {
+      width: 90px; height: 40px; padding: 0 10px;
+      background: #0f172a; border: 1px solid #334155; border-radius: 8px;
+      color: #fff; font-size: 14px; outline: none;
+    }
+    button.btn-gen {
+      height: 40px; padding: 0 20px; border: none; border-radius: 8px;
+      background: #38bdf8; color: #020617; font-weight: 700; font-size: 14px;
+      cursor: pointer;
+    }
+    button.btn-gen:hover { background: #0284c7; color: #fff; }
+    .sub-out {
+      display: none; width: 100%; background: #020617; color: #4ade80;
+      border: 1px dashed #38bdf8; border-radius: 8px; padding: 12px 14px;
+      font-family: ui-monospace, monospace; font-size: 13px; word-break: break-all;
+      cursor: pointer; line-height: 1.5;
+    }
+    .tip { margin-top: 8px; font-size: 13px; color: #94a3b8; min-height: 20px; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h2>節點訂閱連結生成器</h2>
+
+    <label class="field-title" for="tpl">原始節點鏈接</label>
+    <textarea id="tpl" class="tpl-input" placeholder="貼上 vless://... 節點鏈接"></textarea>
+
+    <label class="field-title">選擇地區</label>
+    <div class="regions-wrap" id="regions">${checkboxesHTML}</div>
+
+    <div class="row">
+      <div class="count-box">
+        <label for="count">各地區抽取數量（最多 10）：</label>
+        <input type="number" id="count" min="1" max="10" value="5" />
+      </div>
+      <button class="btn-gen" onclick="generateSubURL()">生成訂閱</button>
+    </div>
+
+    <div id="subResult" class="sub-out" onclick="copySubURL()" title="點擊複製訂閱連結"></div>
+    <div id="tip" class="tip"></div>
+  </div>
+
+  <script>
+    function generateSubURL() {
+      const tpl = document.getElementById('tpl').value.trim();
+      const rawCount = parseInt(document.getElementById('count').value || '5', 10);
+      const count = Number.isFinite(rawCount) ? Math.min(10, Math.max(1, rawCount)) : 5;
+      document.getElementById('count').value = String(count);
+
+      const checked = Array.from(document.querySelectorAll('input[name="region"]:checked')).map((el) => el.value);
+      const outEl = document.getElementById('subResult');
+      const tipEl = document.getElementById('tip');
+
+      if (!tpl) {
+        outEl.style.display = 'none';
+        tipEl.style.color = '#f87171';
+        tipEl.textContent = '請先輸入原始節點鏈接';
+        return;
+      }
+      if (!checked.length) {
+        outEl.style.display = 'none';
+        tipEl.style.color = '#f87171';
+        tipEl.textContent = '請至少勾選一個地區';
+        return;
+      }
+
+      const u = new URL(window.location.origin + '/custom_sub');
+      u.searchParams.set('regions', checked.join(','));
+      u.searchParams.set('count', String(count));
+      u.searchParams.set('tpl', tpl);
+
+      outEl.textContent = u.toString();
+      outEl.style.display = 'block';
+      tipEl.style.color = '#94a3b8';
+      tipEl.textContent = '點擊上方訂閱連結即可複製';
+    }
+
+    async function copySubURL() {
+      const outEl = document.getElementById('subResult');
+      const tipEl = document.getElementById('tip');
+      const text = outEl.textContent.trim();
+      if (!text) return;
+
+      try {
+        await navigator.clipboard.writeText(text);
+        tipEl.style.color = '#4ade80';
+        tipEl.textContent = '已複製訂閱連結到剪貼簿';
+      } catch {
+        const range = document.createRange();
+        range.selectNodeContents(outEl);
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+        document.execCommand('copy');
+        tipEl.style.color = '#4ade80';
+        tipEl.textContent = '已複製訂閱連結到剪貼簿';
+      }
+    }
+  </script>
+</body>
+</html>`;
+}
+
+function escapeHTML(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
 }
 
 // 後台管理網頁 HTML
